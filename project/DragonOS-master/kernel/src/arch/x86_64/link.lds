@@ -1,0 +1,134 @@
+
+OUTPUT_FORMAT("elf64-x86-64","elf64-x86-64","elf64-x86-64")
+OUTPUT_ARCH(i386:x86-64)
+ENTRY(_start)
+
+SECTIONS
+{
+	KERNEL_VMA = 0xffff800000000000;
+	//KERNEL_VMA = 0;
+	. = 0;
+	. = 0x100000;
+	_default_kernel_load_base = .;
+	.boot.text :
+	{
+		KEEP(*(.multiboot_header))
+		KEEP(*(.multiboot2_header))
+		
+		*(.bootstrap)
+		*(.bootstrap.code64)
+		*(.bootstrap.data)
+		
+		. = ALIGN(4096);
+	}
+
+
+	. = ALIGN(32768);
+	. += KERNEL_VMA;
+	text_start_pa = .;
+	__executable_start = .;
+	.text (text_start_pa): AT(text_start_pa - KERNEL_VMA)
+	{
+		_text = .;
+
+		/* any files' .text */
+		*(.text)
+
+		/* any files' .text.*, for example: rust .text._ZN* */
+		*(.text.*)
+
+		_etext = .;
+		__etext = .;
+
+		/* 异常表段 */
+		. = ALIGN(8);
+		__start___ex_table = .;
+		*(__ex_table)
+		__stop___ex_table = .;
+	}
+	. = ALIGN(4096);
+	data_start_pa = .;
+	.data (data_start_pa): AT(data_start_pa - KERNEL_VMA)
+	{
+		_data = .;
+		*(.data)
+		*(.data.*)
+
+		. = ALIGN(0x100);
+		__relocate_kernel_start = .;
+		*(.relocate_kernel_text)
+    	*(.relocate_kernel_data)
+		__relocate_kernel_end = .;
+		
+		_edata = .;
+	}
+
+	. = ALIGN(4096);
+
+	rodata_start_pa = .;
+	.rodata (rodata_start_pa): AT(rodata_start_pa - KERNEL_VMA)
+	{
+		_rodata = .;	
+		*(.rodata)
+		*(.rodata.*)
+		*(.note.gnu.*)
+		*(.fixup)
+		*(.gcc_except_table .gcc_except_table.*)
+		_erodata = .;
+	}
+
+	. = ALIGN(4096);
+
+	trace_point_start_pa = .;
+	.tracepoint (trace_point_start_pa): AT(trace_point_start_pa - KERNEL_VMA)
+    {
+        _tracepoint = .;
+        *(.tracepoint)
+        *(.tracepoint.*)
+        _etracepoint = .;
+    }
+    . = ALIGN(4096);
+
+	syscall_table_start_pa = .;
+	.syscall_table (syscall_table_start_pa): AT(syscall_table_start_pa - KERNEL_VMA)
+    {
+        _syscall_table = .;
+        *(.syscall_table)
+		*(.syscall_table.*)
+        _esyscall_table = .;
+    }
+	
+    . = ALIGN(32768);
+	init_proc_union_start_pa = .;
+	.data.init_proc_union (init_proc_union_start_pa): AT(init_proc_union_start_pa - KERNEL_VMA)
+	 { *(.data.init_proc_union) }
+
+	. = ALIGN(32768);
+	 bss_start_pa = .;
+	.bss (bss_start_pa): AT(bss_start_pa - KERNEL_VMA)
+	{
+		_bss = .;
+		*(.bss)
+		*(.bss.*)
+		_ebss = .;
+	}
+
+	eh_frame = .;
+	.eh_frame (eh_frame): AT(eh_frame - KERNEL_VMA)
+	{
+		__eh_frame_hdr_start = .;
+		*(.eh_frame_hdr)
+		__eh_frame_hdr_end = .;
+		__eh_frame_start = .;
+		*(.eh_frame)
+		*(.rela.eh_frame)
+		__eh_frame_end = .;
+	}
+
+	_end = .;
+
+	/DISCARD/ : {
+		/* *(.eh_frame) */
+		
+	}
+}

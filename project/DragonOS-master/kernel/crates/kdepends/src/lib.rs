@@ -1,0 +1,12 @@
+#![no_std]
+
+pub extern crate thingbuf;
+
+pub extern crate memoffset;
+
+pub extern crate ringbuffer;
+
+pub extern crate crc;
+pub extern crate xarray;
+
+pub extern crate another_ext4;

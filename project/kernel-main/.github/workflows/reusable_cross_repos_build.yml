@@ -1,0 +1,509 @@
+name: Reusable trigger of building cross multiple repositories
+on:
+  workflow_call:
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+      packages: read
+    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, 'build_prs') }}
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/kernel:latest
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Notify job started
+        uses: actions/github-script@v8
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `Job is started, see ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}.`
+            })
+      - name: Download PRs
+        id: fetch_prs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs').promises;
+            const body = context.payload.comment.body;
+            const prRegex = /https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/g;
+            let match;
+            let prs = [];
+            let fetchedPrs = [];
+            while ((match = prRegex.exec(body)) !== null) {
+              let owner = match[1];
+              let repo = match[2];
+              let prNum = match[3];
+              prs.push({owner: owner, repo: repo, pr_num: prNum});
+            }
+            // Get metadata of the PR.
+            await Promise.all(prs.map(async({ owner, repo, pr_num }) => {
+              const { data: pullRequest } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: pr_num,
+              });
+              fetchedPrs.push(`${repo}|${pullRequest.head.sha}|${pullRequest.base.sha}`);
+            }));
+            core.setOutput('fetched_prs', fetchedPrs.join(' '));
+      - name: Init repo
+        run: |
+          git config --global user.email "blueos@vivo.com"
+          git config --global user.name "blueos-ci"
+          repo init --depth=10 -u https://github.com/vivoblueos/manifests.git -b main -m manifest.xml
+      - name: Merge manifests repo
+        run: |
+          set -e
+          set -x
+          fetchedPrs='${{ steps.fetch_prs.outputs.fetched_prs }}'
+          for pr in $fetchedPrs; do
+            repo=$(echo $pr | cut -d '|' -f 1)
+            head_sha=$(echo $pr | cut -d '|' -f 2)
+            base_sha=$(echo $pr | cut -d '|' -f 3)
+
+            if [ "$repo" != "manifests" ]; then
+              continue
+            fi
+
+            git -C .repo/manifests fetch origin $head_sha
+            git -C .repo/manifests fetch origin $base_sha
+            # Ensure the local branch has the merge-base with head_sha
+            git -C .repo/manifests merge $head_sha --no-edit
+          done
+      - name: Sync repo
+        # In case manifests repo is changed.
+        run: |
+          repo sync -j$(nproc)
+      - name: Merge PRs
+        run: |
+          set -e
+          set -x
+          fetchedPrs='${{ steps.fetch_prs.outputs.fetched_prs }}'
+          echo "" > changed_files.txt
+
+          for pr in $fetchedPrs; do
+            repo=$(echo $pr | cut -d '|' -f 1)
+            head_sha=$(echo $pr | cut -d '|' -f 2)
+            base_sha=$(echo $pr | cut -d '|' -f 3)
+
+            if [ "$repo" = "manifests" ]; then
+              continue
+            fi
+
+            repo_path=$(repo list -p "$repo")
+
+            git -C "$repo_path" fetch origin $head_sha
+            git -C "$repo_path" fetch origin $base_sha
+            git -C "$repo_path" diff -M --name-only --diff-filter=ACMR $base_sha...$head_sha \
+              | sed "s|^|${repo}:|" >> changed_files.txt
+            git -C "$repo_path" merge $head_sha --no-edit
+
+          done
+      - name: Upload workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace
+          path: .
+          include-hidden-files: true
+  check_format:
+    runs-on: ubuntu-latest
+    needs: setup
+    permissions:
+      contents: read
+      checks: write
+      packages: read
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/kernel:latest
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download workspace
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace
+          path: .
+      - name: Check format
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { execSync } = require("child_process");
+            const fs = require("fs");
+            const path = require("path");
+            const changedFileList = "changed_files.txt";
+            if (!fs.existsSync(changedFileList)) {
+              core.setFailed("changed_files.txt not found");
+              return;
+            }
+            const lines = fs
+              .readFileSync(changedFileList, "utf-8")
+              .split("\n")
+              .map((l) => l.trim())
+              .filter((l) => l.length > 0);
+            if (lines.length === 0) {
+              console.log("No changed files to check");
+              return;
+            }
+            console.log(`Found ${lines.length} changed files from merge.`);
+            let formatErrors = [];
+            let totalCheckedFiles = 0;
+            for (const entry of lines) {
+              const [repo, file] = entry.split(":");
+              if (!repo || !file) {
+                console.log(`Skipping invalid entry: ${entry}`);
+                continue;
+              }
+              if (repo === "manifests" || repo === "external") {
+                console.log(`Skipping ${repo} for format check`);
+                continue;
+              }
+              console.log(`\nProcessing: repo=${repo}, file=${file}`);
+              const repoPath = execSync(`repo list -p ${repo}`, {
+                encoding: "utf8",
+                stdio: "pipe",
+              }).trim();
+              const filePath = path.join(repoPath, file);
+              const ext = path.extname(filePath).toLowerCase();
+              try {
+                if (ext === ".gn" || ext === ".gni") {
+                  console.log(`Checking GN format for: ${filePath}, ext: ${ext}`);
+                  const out = execSync(`gn format --dry-run \"${filePath}\"`, {
+                    encoding: "utf-8",
+                    stdio: "pipe",
+                  });
+                  if (out.trim()) {
+                    formatErrors.push(`GN formatting issue in ${filePath}:\n${out}`);
+                  }
+                } else if (ext === ".py") {
+                  console.log(`Checking Python format for: ${filePath}`);
+                  const out = execSync(`yapf3 -d \"${filePath}\"`, {
+                    encoding: "utf-8",
+                    stdio: "pipe",
+                  });
+                  if (out.trim()) {
+                    formatErrors.push(`Python formatting issue in ${filePath}:\n${out}`);
+                  }
+                } else if (ext === ".rs") {
+                  console.log(`Checking Rust format for: ${filePath}`);
+                  const out = execSync(
+                    `rustfmt --edition=2021 --check --unstable-features --skip-children \"${filePath}\"`,
+                    {
+                      encoding: "utf-8",
+                      stdio: "pipe",
+                    }
+                  );
+                  if (out.trim()) {
+                    formatErrors.push(`Rust formatting issue in ${filePath}:\n${out}`);
+                  }
+                } else if (ext === ".yml" || ext === ".yaml") {
+                  console.log(`Checking YAML format for: ${filePath}`);
+                  const out = execSync(`yamlfmt -lint \"${filePath}\"`, {
+                    encoding: "utf-8",
+                    stdio: "pipe",
+                  });
+                  if (out.trim()) {
+                    formatErrors.push(`YAML formatting issue in ${filePath}:\n${out}`);
+                  }
+                }
+                totalCheckedFiles++;
+              } catch (error) {
+                // Check if it's a formatting error or other error
+                const output = (error.stdout || "") + (error.stderr || "");
+                if (output.includes("format") || output.includes("Format")) {
+                  formatErrors.push(`Formatting issue in ${repo}/${file}:\n${output}`);
+                } else {
+                  console.log(
+                    `Skipping format check for ${repo}/${file}: ${error.message}`
+                  );
+                }
+              }
+            }
+
+            console.log(`\nTotal files checked: ${totalCheckedFiles}`);
+            if (formatErrors.length > 0) {
+              console.log("❌ Format check failed:");
+              formatErrors.forEach((error) => console.log(error));
+              core.setFailed("Format check failed");
+              process.exit(1);
+            } else {
+              console.log("✅ All modified files pass format check");
+            }
+  check_license:
+    runs-on: ubuntu-latest
+    needs: setup
+    permissions:
+      contents: read
+      checks: write
+      packages: read
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/kernel:latest
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download workspace
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace
+          path: .
+      - name: Check license
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { execSync } = require("child_process");
+            const fs = require("fs");
+            const path = require("path");
+            const changedFileList = "changed_files.txt";
+            if (!fs.existsSync(changedFileList)) {
+              core.setFailed("changed_files.txt not found");
+              return;
+            }
+            const lines = fs
+              .readFileSync(changedFileList, "utf-8")
+              .split("\n")
+              .map((l) => l.trim())
+              .filter((l) => l.length > 0);
+            if (lines.length === 0) {
+              console.log("No changed files to check");
+              return;
+            }
+            console.log(`Found ${lines.length} changed files from merge.`);
+            let repos = new Set();
+            for (const entry of lines) {
+              const [repo, file] = entry.split(':');
+              if (!repo || !file) continue;
+              if (repo === 'manifests' ||
+                repo.includes('external') ||
+                repo.includes('libc') ||
+                repo.includes('book')) {
+                console.log(`Skipping ${repo} for license check`);
+                continue;
+              }
+
+              repos.add(repo);
+            }
+            if (repos.size === 0) {
+              console.log('✅ No repos require license header checks.');
+              return;
+            }
+            let failedRepos = [];
+            let checkedRepos = [];
+            for (const repo of repos) {
+              console.log(`\nChecking license headers in repo: ${repo}`);
+              const repoPath = execSync(`repo list -p ${repo}`, {
+                encoding: "utf8",
+                stdio: "pipe",
+              }).trim();
+              const licenseRcPath = path.join(repoPath, '.licenserc.yaml');
+              if (!fs.existsSync(licenseRcPath)) {
+                console.log(`No .licenserc.yaml found in ${repoPath}, skipping`);
+                continue;
+              }
+              console.log(`Found .licenserc.yaml in ${repoPath}`);
+              try {
+                const result = execSync(`license-eye header check`, {
+                  encoding: 'utf8',
+                  stdio: 'pipe',
+                  cwd: repoPath
+                });
+                // license-eye outputs text even when OK, we need pattern check
+                if (result.includes('ERROR one or more files does not have a valid license header')) {
+                  console.log(`License issue in ${repoPath}:\n${result}`);
+                  failedRepos.push(repoPath);
+                }
+              } catch (e) {
+                const out = (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : '');
+                if (out.includes('ERROR one or more files does not have a valid license header')) {
+                  console.log(`License issue in ${repoPath}:\n${out}`);
+                  failedRepos.push(repoPath);
+                } else {
+                  console.log(`Error running license-eye in ${repoPath}:\n${out}`);
+                  failedRepos.push(repoPath);
+                }
+              }
+            }
+            if (failedRepos.length > 0) {
+              core.setFailed(`❌ License header issues found in these repos: ${failedRepos.join(', ')}`);
+              process.exit(1);
+            } else {
+              console.log('✅ All checked repos have valid license headers!');
+            }
+  build_host:
+    runs-on: ubuntu-latest
+    needs: setup
+    permissions:
+      contents: read
+      checks: write
+      packages: read
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/kernel:latest
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download workspace
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace
+          path: .
+      - name: Build and test kernel for host
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { execSync } = require('child_process');
+
+            const board = 'none';
+            const configs = [
+              { name: 'debug', build_type: 'debug', direct_syscall_handler: 'false' },
+              { name: 'release', build_type: 'release', direct_syscall_handler: 'false' }
+            ];
+
+            for (const config of configs) {
+              console.log(`\nBuilding ${board} ${config.name} version...`);
+
+              const outDir = `out/${board}.${config.name}`;
+              const args = `board="${board}" build_type="${config.build_type}" direct_syscall_handler=${config.direct_syscall_handler}`;
+
+              try {
+                // Generate build files
+                console.log(`Running: gn gen ${outDir} --args='${args}'`);
+                execSync(`gn gen ${outDir} --args='${args}'`, { stdio: 'inherit' });
+
+                // Build default targets.
+                console.log(`Running: ninja -C ${outDir} default`);
+                execSync(`ninja -C ${outDir} default`, { stdio: 'inherit' });
+
+                // Build and test
+                console.log(`Running: ninja -C ${outDir} check_all`);
+                execSync(`ninja -C ${outDir} check_all`, { stdio: 'inherit' });
+
+                console.log(`✅ ${board} ${config.name} build completed successfully`);
+              } catch (error) {
+                console.error(`❌ ${board} ${config.name} build failed:`, error.message);
+                process.exit(1);
+              }
+            }
+  build_and_check_virtual_boards:
+    runs-on: ubuntu-latest
+    needs: setup
+    permissions:
+      contents: read
+      checks: write
+      packages: read
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/kernel:latest
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      matrix:
+        board: [qemu_mps2_an385, qemu_mps3_an547, qemu_riscv64, qemu_virt64_aarch64, qemu_riscv32]
+        build_type: [release, debug]
+        syscall_mode: [swi, dsc]
+    steps:
+      - name: Download workspace
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace
+          path: .
+      - name: Build and test kernel for ${{ matrix.board }}.${{ matrix.build_type }}.${{ matrix.syscall_mode }}
+        uses: actions/github-script@v8
+        env:
+          BOARD: '${{ matrix.board }}'
+          BUILD_TYPE: '${{ matrix.build_type }}'
+          SYSCALL_MODE: '${{ matrix.syscall_mode }}'
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const board = process.env.BOARD;
+            const buildType = process.env.BUILD_TYPE;
+            const syscallMode = process.env.SYSCALL_MODE;
+            const profile = `${board}.${buildType}.${syscallMode}`;
+            const outDir = `out/${profile}`;
+            const isDirectSyscall = syscallMode === 'dsc';
+            const args = `board="${board}" build_type="${buildType}" direct_syscall_handler=${isDirectSyscall}`;
+            try {
+                // Generate build files.
+                console.log(`Running: gn gen ${outDir} --args='${args}'`);
+                execSync(`gn gen ${outDir} --args='${args}'`, { stdio: 'inherit' });
+
+                // Build and test.
+                console.log(`Running: ninja -C ${outDir} check_all`);
+                execSync(`ninja -C ${outDir} check_all`, { stdio: 'inherit' });
+
+                console.log(`✅ ${profile} build completed successfully`);
+            } catch (error) {
+                console.error(`❌ ${profile} build failed:`, error.message);
+                process.exit(1);
+            }
+  notify:
+    runs-on: ubuntu-latest
+    needs: [setup, check_format, check_license, build_host, build_and_check_virtual_boards]
+    if: ${{ always() && github.event.issue.pull_request && contains(github.event.comment.body, 'build_prs') }}
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      - name: Notify job ended
+        uses: actions/github-script@v8
+        with:
+          script: |
+            // Check if any job failed
+            const jobStatuses = {
+              setup: "${{ needs.setup.result }}",
+              check_format: "${{ needs.check_format.result }}",
+              check_license: "${{ needs.check_license.result }}",
+              build_host: "${{ needs.build_host.result }}",
+              build_and_check_virtual_boards: "${{ needs.build_and_check_virtual_boards.result }}",
+            };
+            // Debug: Log all job statuses
+            console.log('Job statuses:', JSON.stringify(jobStatuses, null, 2));
+            const failedJobs = Object.entries(jobStatuses)
+              .filter(([job, status]) => {
+                const isFailed = status === 'failure' || status === 'cancelled';
+                if (isFailed) {
+                  console.log(`Job ${job} failed with status: ${status}`);
+                }
+                return isFailed;
+              })
+              .map(([job, status]) => `${job} (${status})`);
+            const skippedJobs = Object.entries(jobStatuses)
+              .filter(([job, status]) => {
+                const isSkipped = status === 'skipped';
+                if (isSkipped) {
+                  console.log(`Job ${job} was skipped with status: ${status}`);
+                }
+                return isSkipped;
+              })
+              .map(([job, status]) => `${job} (${status})`);
+            console.log(`Failed jobs: ${failedJobs.length}, Skipped jobs: ${skippedJobs.length}`);
+            let statusMessage;
+            let sign;
+            if (failedJobs.length > 0) {
+              sign = '❌';
+              statusMessage = `Job failed. Failed jobs: ${failedJobs.join(', ')}`;
+              if (skippedJobs.length > 0) {
+                statusMessage += `. Skipped jobs: ${skippedJobs.join(', ')}`;
+              }
+            } else if (skippedJobs.length > 0) {
+              sign = '⚠️';
+              statusMessage = `Job completed with skipped jobs: ${skippedJobs.join(', ')}`;
+            } else {
+              sign = '✅';
+              statusMessage = 'All jobs completed successfully';
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${sign} ${statusMessage}, see ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}.`
+            })

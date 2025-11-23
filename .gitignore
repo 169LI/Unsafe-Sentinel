@@ -1,4 +1,0 @@
-project/
-vulnfusion/target/
-reports/*
-!reports/*-verified-unlimited.md

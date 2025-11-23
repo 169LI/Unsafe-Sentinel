@@ -1,0 +1,34 @@
+/cmake-build-debug/
+/bin/
+!.gitkeep
+DragonOS.iso
+.idea/
+/tmp/
+kernel/kernel
+.DS_Store
+
+*.o
+*.a
+*.s
+out
+serial_opt.txt
+docs/_build
+draft
+cppcheck.xml
+/target/
+.cache
+compile_commands.json
+/logs/
+*.log
+
+# Nix dev files
+/.envrc
+/.direnv/
+/flake.nix
+flake.lock
+/default.nix
+
+# initram
+*.cpio
+*.cpio.xz
+*.cpio*

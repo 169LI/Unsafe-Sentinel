@@ -1,0 +1,17 @@
+PtyTrunc.Truncate
+PtyTest.TermiosIGNCR
+PtyTest.TermiosINLCR
+PtyTest.TermiosONOCR
+PtyTest.TermiosOCRNL
+PtyTest.TermiosICANONNewline
+PtyTest.TermiosICANONEOF
+PtyTest.CanonDiscard
+PtyTest.VEOLTermination
+PtyTest.SwitchCanonToNoncanon
+PtyTest.SwitchNoncanonToCanonNoNewlineBig
+PtyTest.SwitchTwiceMultiline
+JobControlTest.SetTTYBadArg
+JobControlTest.SetTTYDifferentSession
+JobControlTest.ReleaseTTYSignals
+JobControlTest.SetForegroundProcessGroup
+JobControlTest.SetForegroundProcessGroupEmptyProcessGroup

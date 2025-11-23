@@ -1,0 +1,83 @@
+# File and Directory Operations
+
+<!--
+Put system calls such as
+open, openat, creat, close, read, write, readv, writev, pread64, 
+pwrite64, lseek, stat, fstat, lstat, statx, mkdir, rmdir, link, 
+unlink, rename, symlink, readlink, chmod, fchmod, chown, fchown, 
+utime, and utimensat
+under this category.
+-->
+
+### `open` and `openat`
+
+Supported functionality of `open` in SCML:
+
+```c
+{{#include open_and_openat.scml}}
+```
+
+Silently-ignored flags:
+* `O_NOCTTY`
+* `O_DSYNC`
+* `O_SYNC`
+* `O_LARGEFILE`
+* `O_NOATIME`
+* `O_NOCTTY`
+
+Partially-supported flags:
+* `O_PATH`
+
+Unsupported flags:
+* `O_TMPFILE`
+
+Supported and unsupported functionality of `openat` are the same as `open`.
+The SCML rules are omitted for brevity.
+
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/openat.2.html).
+
+### `renameat2`
+
+Supported functionality in SCML:
+
+```c
+{{#include renameat2.scml}}
+```
+
+Unsupported flags:
+* `RENAME_EXCHANGE`
+* `RENAME_NOREPLACE`
+* `RENAME_WHITEOUT`
+
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/rename.2.html).
+
+### `lseek`
+
+Supported functionality in SCML:
+
+```c
+{{#include lseek.scml}}
+```
+
+Unsupported flags:
+* `SEEK_DATA`
+* `SEEK_HOLE`
+
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/lseek.2.html).
+
+### `newfstatat`
+
+Supported functionality in SCML:
+
+```c
+{{#include newfstatat.scml}}
+```
+
+Silently-ignored flags:
+* `AT_NO_AUTOMOUNT`
+
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/newfstatat.2.html).

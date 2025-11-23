@@ -1,0 +1,151 @@
+use alloc::sync::Arc;
+use system_error::SystemError;
+
+use crate::{
+    arch::{
+        interrupt::TrapFrame,
+        process::table::{USER_CS, USER_DS},
+        MMArch,
+    },
+    mm::{verify_area, MemoryManagementArch, VirtAddr},
+    process::{
+        exec::{BinaryLoaderResult, ExecParam},
+        ProcessControlBlock, ProcessManager,
+    },
+    syscall::{user_access::UserBufferWriter, Syscall},
+};
+
+impl Syscall {
+    pub fn arch_do_execve(
+        regs: &mut TrapFrame,
+        param: &ExecParam,
+        load_result: &BinaryLoaderResult,
+        user_sp: VirtAddr,
+        argv_ptr: VirtAddr,
+    ) -> Result<(), SystemError> {
+        // debug!("write proc_init_info to user stack done");
+
+        // （兼容旧版libc）把argv的指针写到寄存器内
+        // TODO: 改写旧版libc，不再需要这个兼容
+        regs.rdi = param.init_info().args.len() as u64;
+        regs.rsi = argv_ptr.data() as u64;
+
+        // 设置系统调用返回时的寄存器状态
+        // TODO: 中断管理重构后，这里的寄存器状态设置要删掉！！！改为对trap frame的设置。要增加架构抽象。
+        regs.rsp = user_sp.data() as u64;
+        regs.rbp = user_sp.data() as u64;
+        regs.rip = load_result.entry_point().data() as u64;
+
+        regs.cs = USER_CS.bits() as u64;
+        regs.ds = USER_DS.bits() as u64;
+        regs.ss = USER_DS.bits() as u64;
+        regs.es = 0;
+        regs.rflags = 0x200;
+        regs.rax = 1;
+
+        // debug!("regs: {:?}\n", regs);
+
+        // crate::debug!(
+        //     "tmp_rs_execve: done, load_result.entry_point()={:?}",
+        //     load_result.entry_point()
+        // );
+
+        return Ok(());
+    }
+
+    /// ## 用于控制和查询与体系结构相关的进程特定选项
+    ///
+    /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kernel/process_64.c#913
+    ///
+    /// ## 错误处理逻辑
+    ///
+    /// 该函数采用分层处理策略:
+    /// 1. 首先尝试 `do_arch_prctl_64` 处理x86_64特定选项(FS/GS base)
+    /// 2. **仅当返回 EINVAL 时**,说明该选项不是x86_64特定的,尝试 `do_arch_prctl_common` 处理通用选项
+    /// 3. 其他错误(EPERM, EFAULT等)直接返回,**不会**fallback到common handler
+    ///
+    /// 这种设计符合Linux语义:EINVAL表示"无效选项",其他错误表示"选项有效但操作失败"
+    pub fn arch_prctl(option: usize, arg2: usize) -> Result<usize, SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        let result = Self::do_arch_prctl_64(&pcb, option, arg2, true);
+
+        if let Err(SystemError::EINVAL) = result {
+            Self::do_arch_prctl_common(option, arg2)?;
+            Ok(0)
+        } else {
+            result
+        }
+    }
+
+    /// ## 64位下控制fs/gs base寄存器的方法
+    pub fn do_arch_prctl_64(
+        pcb: &Arc<ProcessControlBlock>,
+        option: usize,
+        arg2: usize,
+        from_user: bool,
+    ) -> Result<usize, SystemError> {
+        let mut arch_info = pcb.arch_info_irqsave();
+        match option {
+            ARCH_GET_FS => {
+                unsafe { arch_info.save_fsbase() };
+                let mut writer = UserBufferWriter::new(
+                    arg2 as *mut usize,
+                    core::mem::size_of::<usize>(),
+                    from_user,
+                )?;
+                writer.copy_one_to_user(&arch_info.fsbase, 0)?;
+            }
+            ARCH_GET_GS => {
+                unsafe { arch_info.save_gsbase() };
+                let mut writer = UserBufferWriter::new(
+                    arg2 as *mut usize,
+                    core::mem::size_of::<usize>(),
+                    from_user,
+                )?;
+                writer.copy_one_to_user(&arch_info.gsbase, 0)?;
+            }
+            ARCH_SET_FS => {
+                // 验证FS地址是否为有效的用户空间地址
+                let fs_addr = VirtAddr::new(arg2);
+                verify_area(fs_addr, MMArch::PAGE_SIZE).map_err(|_| SystemError::EPERM)?;
+                arch_info.fsbase = arg2;
+                // 如果是当前进程则直接写入寄存器
+                if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
+                    unsafe { arch_info.restore_fsbase() }
+                }
+            }
+            ARCH_SET_GS => {
+                // 验证GS地址是否为有效的用户空间地址
+                let gs_addr = VirtAddr::new(arg2);
+                verify_area(gs_addr, MMArch::PAGE_SIZE).map_err(|_| SystemError::EPERM)?;
+                arch_info.gsbase = arg2;
+                if pcb.raw_pid() == ProcessManager::current_pcb().raw_pid() {
+                    unsafe { arch_info.restore_gsbase() }
+                }
+            }
+            _ => {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        Ok(0)
+    }
+
+    #[allow(dead_code)]
+    pub fn do_arch_prctl_common(option: usize, arg2: usize) -> Result<usize, SystemError> {
+        // Don't use 0x3001-0x3004 because of old glibcs
+        if (0x3001..=0x3004).contains(&option) {
+            return Err(SystemError::EINVAL);
+        }
+
+        todo!(
+            "do_arch_prctl_common not unimplemented, option: {}, arg2: {}",
+            option,
+            arg2
+        );
+    }
+}
+
+pub const ARCH_SET_GS: usize = 0x1001;
+pub const ARCH_SET_FS: usize = 0x1002;
+pub const ARCH_GET_FS: usize = 0x1003;
+pub const ARCH_GET_GS: usize = 0x1004;

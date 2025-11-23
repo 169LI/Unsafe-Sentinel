@@ -1,0 +1,10 @@
+[Unit]
+Description=Shell
+
+[Service]
+Type=simple
+ExecStart=/bin/sh
+Restart=always
+ExecStartPre=-/bin/about.elf
+Environment=PATH=/bin:/usr/bin:/usr/local/bin
+Environment=LD_LIBRARY_PATH=/usr/lib:/usr/lib64:/usr/local/lib
