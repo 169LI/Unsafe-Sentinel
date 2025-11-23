@@ -1,9 +1,4 @@
-target/
-reports/
 project/
-.trae/
-*.log
-*.tmp
-*.bak
-Thumbs.db
-.DS_Store
+vulnfusion/target/
+reports/*
+!reports/*-verified-unlimited.md
